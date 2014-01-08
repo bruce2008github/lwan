@@ -630,17 +630,21 @@ _parse_http_request(lwan_request_t *request, lwan_request_parse_t *helper)
 }
 
 static bool
-_authorize(lwan_request_t *request, lwan_request_parse_t *helper)
+_authorize(lwan_request_t *request, lwan_request_parse_t *helper,
+                                                    lwan_url_map_t *url_map)
 {
     static const size_t basic_len = sizeof("Basic ") - 1;
 
     if (!helper->authorization.value) {
         lwan_key_value_t *headers;
+        static const char value[] = "Basic realm=\"%s\"";
 
 unauthorized:
         headers = coro_malloc(request->conn->coro, 2 * sizeof(*headers));
         headers[0].key = "WWW-Authenticate";
-        headers[0].value = "Basic realm=\"Lwan\"";
+        headers[0].value = coro_malloc(request->conn->coro,
+                    sizeof(value) + strlen(url_map->authorization.realm) + 1);
+        sprintf(headers[0].value, value, url_map->authorization.realm);
         headers[1].key = headers[1].value = NULL;
 
         request->response.headers = headers;
@@ -653,11 +657,25 @@ unauthorized:
     helper->authorization.value += basic_len;
     helper->authorization.len -= basic_len;
 
-    /* Username is "admin", password is "tijolo22" */
-    static const char authorization_info[] = "YWRtaW46dGlqb2xvMjI=";
-    if (!strncmp(helper->authorization.value, authorization_info, sizeof(authorization_info) - 1))
-        return true;
+    FILE *f = fopen(url_map->authorization.password_file, "r");
+    if (f) {
+        char buffer[256];
 
+        while (fgets(buffer, 256, f)) {
+            char *lf = strchr(buffer, '\n');
+            if (lf)
+                *lf = '\0';
+            if (!strncmp(helper->authorization.value, buffer, 256)) {
+                fclose(f);
+                return true;
+            }
+        }
+
+        fclose(f);
+    } else {
+        lwan_status_error("Authorization file \"%s\" not found",
+                                    url_map->authorization.password_file);
+    }
     goto unauthorized;
 }
 
@@ -715,7 +733,7 @@ lwan_process_request(lwan_t *l, lwan_request_t *request)
         }
     }
     if (url_map->flags & HANDLER_MUST_AUTHORIZE) {
-        if (!_authorize(request, &helper)) {
+        if (!_authorize(request, &helper, url_map)) {
             lwan_default_response(request, HTTP_NOT_AUTHORIZED);
             return;
         }

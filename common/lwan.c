@@ -64,6 +64,8 @@ static void destroy_urlmap(void *data)
 
     if (handler && handler->shutdown)
         handler->shutdown(url_map->data);
+    free(url_map->authorization.realm);
+    free(url_map->authorization.password_file);
     free(url_map->prefix);
     free(url_map);
 }
@@ -86,9 +88,54 @@ static lwan_url_map_t *add_url_map(lwan_trie_t *t, const char *prefix, const lwa
     return copy;
 }
 
+static void parse_listener_prefix_authorization(config_t *c,
+                    config_line_t *l, lwan_url_map_t *url_map)
+{
+    if (strcmp(l->section.param, "basic")) {
+        config_error(c, "Only basic authorization supported");
+        return;
+    }
+
+    memset(&url_map->authorization, 0, sizeof(url_map->authorization));
+
+    while (config_read_line(c, l)) {
+        switch (l->type) {
+        case CONFIG_LINE_TYPE_LINE:
+            if (!strcmp(l->line.key, "realm")) {
+                free(url_map->authorization.realm);
+                url_map->authorization.realm = strdup(l->line.value);
+            } else if (!strcmp(l->line.key, "password file")) {
+                free(url_map->authorization.password_file);
+                url_map->authorization.password_file = strdup(l->line.value);
+            }
+            break;
+
+        case CONFIG_LINE_TYPE_SECTION:
+            config_error(c, "Unexpected section: %s", l->section.name);
+            goto error;
+
+        case CONFIG_LINE_TYPE_SECTION_END:
+            if (!url_map->authorization.realm)
+                url_map->authorization.realm = strdup("Lwan");
+            if (!url_map->authorization.password_file)
+                url_map->authorization.password_file = strdup("htpasswd");
+
+            url_map->flags |= HANDLER_MUST_AUTHORIZE;
+            goto out;
+        }
+    }
+
+out:
+    return;
+
+error:
+    free(url_map->authorization.realm);
+    free(url_map->authorization.password_file);
+}
+
 static void parse_listener_prefix(config_t *c, config_line_t *l, lwan_t *lwan)
 {
-    lwan_url_map_t url_map;
+    lwan_url_map_t url_map = {0};
     struct hash *hash = hash_str_new(free, free);
     lwan_handler_t *handler = NULL;
     void *callback = NULL;
@@ -116,8 +163,14 @@ static void parse_listener_prefix(config_t *c, config_line_t *l, lwan_t *lwan)
 
           break;
       case CONFIG_LINE_TYPE_SECTION:
-          config_error(c, "Expecting line or section end");
-          goto out;
+          if (!strcmp(l->section.name, "authorization")) {
+              parse_listener_prefix_authorization(c, l, &url_map);
+          } else {
+              config_error(c, "Unknown section type: \"%s\"", l->section.name);
+              goto out;
+          }
+
+          break;
       case CONFIG_LINE_TYPE_SECTION_END:
           goto add_map;
       }
@@ -138,13 +191,13 @@ add_map:
 
     if (callback) {
         url_map.callback = callback;
-        url_map.flags = HANDLER_PARSE_MASK;
+        url_map.flags |= HANDLER_PARSE_MASK;
         url_map.data = data;
         url_map.handler = NULL;
     } else if (handler && handler->init_from_hash && handler->handle) {
         url_map.data = handler->init_from_hash(hash);
         url_map.callback = handler->handle;
-        url_map.flags = handler->flags;
+        url_map.flags |= handler->flags;
         url_map.handler = handler;
     } else {
         config_error(c, "Invalid handler");
